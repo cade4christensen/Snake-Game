@@ -1,0 +1,576 @@
+﻿@*</author> Tom Rasmussen and Cade Christensen
+</date> 11/21/2025*@
+@page "/snake"
+@rendermode InteractiveServer
+@using Blazor.Extensions
+@using Blazor.Extensions.Canvas
+@using Blazor.Extensions.Canvas.Canvas2D
+@using System.Diagnostics
+@using System.Reflection.Metadata.Ecma335
+@using System.Text.Json
+@using System.Transactions
+@using GUI.Client.Controllers
+@using GUI.Client.Models
+@using Snake.Controllers
+@inject IJSRuntime JsRuntime;
+
+<PageTitle> Snake </PageTitle>
+<label> Server: <input @bind="_serverHost"/> </label>
+<label> Port: <input @bind="_serverPort"/> </label>
+<label> Player Name: <input @bind ="@_playerName"/> </label>
+
+@if (!_isConnected)
+{
+    @if (!_errorDetected)
+    {
+        <button class="btn btn-primary" @onclick="HandleNetwork">Connect</button>
+    }
+}
+else
+{
+    <button class="btn btn-primary" @onclick="Disconnect">Disconnect</button>
+}
+
+@if (_errorDetected && !_isConnected)
+{
+    <p style="color: red">@_errorMessage</p>
+    <button class="btn btn-primary" @onclick="HandleNetwork">Retry</button>
+
+}
+
+<img id="bgImage" src="images/Background.png" style="display:none;" @ref="_backgroundImage" />
+<img id="wImage" src="images/WallSprite.png" style="display:none;" @ref="_wallSprite" />
+
+
+<div id="snakeCanvas" style="position: fixed; width: 100%; height: 100%">
+    <BECanvas Width="1000" Height="1000" @ref="_canvasReference"></BECanvas>
+</div>
+
+@code
+{
+    /// <summary>
+    /// Reference to the BECanvas component used for rendering the game.
+    /// </summary>
+    private BECanvasComponent _canvasReference = null!;
+    
+    /// <summary>
+    /// Canvas 2D drawing context used to render game graphics.
+    /// </summary>
+    private Canvas2DContext _context = null!;
+    
+    /// <summary>
+    /// Reference to the imported JavaScript module for input handling and utilities.
+    /// </summary>
+    private IJSObjectReference _jsModule = null!;
+    
+    /// <summary>
+    /// The player's displayed name.
+    /// </summary>
+    private string _playerName = "";
+    
+    /// <summary>
+    /// Hostname of the game server.
+    /// </summary>
+    private string _serverHost = "localhost";
+    
+    /// <summary>
+    /// Port number used when connecting to the game server.
+    /// </summary>
+    private int _serverPort = 11000;
+    
+    /// <summary>
+    /// Indicates whether the client is currently connected to the game server.
+    /// </summary>
+    private bool _isConnected = false;
+
+    /// <summary>
+    /// Controller responsible for handling networking and communication with the server.
+    /// </summary>
+    private NetworkController _controller = new ();
+
+    /// <summary>
+    /// Initialize the Database helper
+    /// </summary>
+    private DatabaseHelper _db = new DatabaseHelper();
+    
+    /// <summary>
+    /// The world state received from the server.
+    /// </summary>
+    private Worlds _world;
+    
+    /// <summary>
+    /// A race-condition-free copied world state used exclusively for rendering.
+    /// </summary>
+    private Worlds _worldCopy;
+    
+    /// <summary>
+    /// Reference to the background image.
+    /// </summary>
+    private ElementReference _backgroundImage;
+    
+    /// <summary>
+    /// Reference to the wall sprite image.
+    /// </summary>
+    private ElementReference _wallSprite;
+
+    /// <summary>
+    /// Width of the visible canvas area.
+    /// </summary>
+    private int _viewWidth = 1000;
+    
+    /// <summary>
+    /// Height of the visible canvas area.
+    /// </summary>
+    private int _viewHeight = 1000;
+
+    /// <summary>
+    /// Default world size used when initializing a new instance of world.
+    /// </summary>
+    private int _defaultWorldSize = 2000;
+    
+    /// <summary>
+    /// Current X-position of the camera.
+    /// </summary>
+    private double _cameraX;
+    
+    /// <summary>
+    /// Current Y-position of the camera.
+    /// </summary>
+    private double _cameraY;
+    
+    /// <summary>
+    /// Indicates whether initial camera positioning has been completed.
+    /// </summary>
+    private bool _camStarted = false;
+    
+    /// <summary>
+    /// Stores the last known score for the player's snake.
+    /// </summary>
+    private int _snakeLastScore = 0;
+    
+    /// <summary>
+    /// Timestamp of the most recent powerup pickup animation trigger.
+    /// </summary>
+    private DateTime _updatedScoreSnakeFlash = DateTime.MinValue;
+    
+    /// <summary>
+    /// Whether the flash from collecting a powerup is currently active.
+    /// </summary>
+    private bool _foodFlash = false;
+
+    /// <summary>
+    /// Indicates whether an error occurred during server connection.
+    /// </summary>
+    private bool _errorDetected = false;
+    
+    /// <summary>
+    /// Stores the displayed error message when connection fails.
+    /// </summary>
+    private string _errorMessage = "Connection failed to server. Please retry.";
+    
+    /// <summary>
+    /// Reference to the current game Id.
+    /// </summary>
+    private int _currentGameId = -1;
+    
+    /// <summary>
+    /// Executes logic after the component has finished rendering.  
+    /// This method initializes the JavaScript module, sets up the rendering context,
+    /// registers input handlers, and starts the main game loop.  
+    /// </summary>
+    /// <param name="firstRender">
+    /// Indicates whether this is the first time the component has been rendered.
+    /// </param>
+    /// <returns>
+    /// A task that represents the asynchronous operation after render.
+    /// </returns>
+    protected override async Task OnAfterRenderAsync( bool firstRender )
+    {
+        if ( firstRender )
+        {
+            _jsModule = await JsRuntime.InvokeAsync<IJSObjectReference>( "import", "./Pages/SnakeGUI.razor.js" );
+            _context = await _canvasReference.CreateCanvas2DAsync();
+            await JsRuntime.InvokeAsync<object>( "initRenderJS", DotNetObjectReference.Create( this ) );           
+
+            GameLoop(); //Start the GameLoop
+
+        }
+    }
+
+    /// <summary>
+    /// Connects the client to the game server using the specified host, port, player name, along with a created default world to pass over.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task HandleNetwork()
+    {
+        try
+        {
+            _world = new Worlds(_defaultWorldSize);
+            
+            new Thread(() =>
+            {
+                _controller.NetworkConnectAsync(_serverHost, _serverPort, _playerName, _world);
+            }).Start();
+            
+            Thread.Sleep(20);
+            
+            
+            if (!_controller.IsConnected) //Cant connect to server, display error
+            {
+                _errorDetected = true;
+                _isConnected = false;
+                return;
+            }
+            
+            _isConnected = true;
+
+            //So game runs if not connected to vpn, however no database entry.
+            try
+            {
+                _currentGameId = await _db.AddGameAsync();
+            }
+            catch
+            {
+                
+            }
+
+        }
+        catch (Exception ex)
+        {
+            _isConnected = false;
+        }
+    }
+    
+    /// <summary>
+    /// Disconnects the client from the game server.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task Disconnect()
+    {
+        if (_currentGameId != -1)
+        {
+            await _db.EndGameAsync(_currentGameId);
+        }
+        _controller.DisconnectAsync();
+        _isConnected = false;
+        _errorDetected = false;
+        _currentGameId = -1;
+        
+        StateHasChanged();
+    }
+
+    /// <summary>
+    /// Main game loop, repeatedly draws frames at expected 20 milliseconds.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task GameLoop()
+    {
+        while (true)
+        {
+            await DrawFrame();
+            await Task.Delay(20);
+        }
+    }
+    
+    /// <summary>
+    /// Draws a single frame of the game, including the background, walls, snakes, and powerups.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task DrawFrame()
+    {
+        // If not connected or canvas/world not ready, skip drawing
+        if (!_isConnected)
+        {
+            return;
+        }
+        
+        // Make a thread-safe copy of the world state
+        lock (_world)
+        {
+            _worldCopy = new Worlds(_world);
+        }
+        foreach (var _snake in _worldCopy.Snakes.Values)
+        {
+            if (!_snake.PlayerInserted && _currentGameId!=-1)
+            {
+                 _db.AddPlayerAsync(_snake.Id, _snake.name, _currentGameId);
+                _snake.PlayerInserted = true;
+            }
+            
+            if (_snake.dc && !_snake.LeaveTimeRecorded && _currentGameId!=-1)
+            {
+                 _db.UpdateLeaveTimeAsync(_snake.Id, _currentGameId, DateTime.Now);
+                _snake.LeaveTimeRecorded = true;
+            }
+        }
+        await _context.BeginBatchAsync();
+        
+        // Clear the full canvas with a solid background color
+        await _context.SetFillStyleAsync("red");
+        await _context.FillRectAsync(0, 0, _viewWidth, _viewHeight);
+        
+        // Clip the drawing area to the visible canvas rectangle
+        await _context.BeginPathAsync();
+        await _context.RectAsync(0, 0, _viewWidth, _viewHeight);
+        await _context.ClipAsync();
+        await _context.SaveAsync();
+        
+        //Camera logic
+        Snakes currentSnake = null;
+
+        // Get the player's snake
+        if (_worldCopy.Snakes.TryGetValue(_worldCopy.PlayerId, out var snake) && snake.body.Count > 0)
+        {
+            currentSnake = snake;
+        }
+        if (currentSnake != null)
+        {
+            var head = currentSnake.body.Last();
+
+            // Initialize camera on first frame
+            if (!_camStarted)
+            {
+                _cameraX = head.X;
+                _cameraY = head.Y;
+                _camStarted = true;
+            }
+                
+            // Update camera to follow the snake as long as it’s alive
+            if (!currentSnake.died)
+            {
+                _cameraX = head.X;
+                _cameraY = head.Y;
+            }
+        }
+
+        // Convert world coordinates to camera-relative coordinates
+        double canvasX = -_cameraX;
+        double canvasY = -_cameraY;
+
+        // Move origin to center of canvas, then apply camera offset
+        await _context.TranslateAsync(_viewWidth / 2, _viewHeight / 2);
+        await _context.TranslateAsync(canvasX, canvasY);
+        
+        //Draw Game Objects
+        await DrawBackground();
+        await DrawWalls();
+        //await DrawPowerupDetected();
+        await DrawSnakes();
+        await DrawPowerups();
+        await DrawPowerupDetected();
+
+        await _context.RestoreAsync();
+        await _context.EndBatchAsync();
+        StateHasChanged();
+    }
+    
+    /// <summary>
+    /// Draws all powerups on the canvas.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task DrawPowerups()
+    {
+        foreach (Powerups power in _worldCopy.Powerups.Values)
+        {
+            await _context.BeginPathAsync();
+            await _context.SetFillStyleAsync("red");
+            await _context.ArcAsync(power.loc.X, power.loc.Y, 8, 0, Math.PI * 2); //Powerup 16x16 circle
+            await _context.FillAsync();
+        }
+    }
+
+    /// <summary>
+    /// Detects when the player's snake has collected a powerup by checking for an 
+    /// increase in score, then triggers the visual feedback for the event- +1 gets displayed and
+    /// when detected starts set up for snake to flash light green
+    /// </summary>
+    /// <returns>
+    /// A task representing the asynchronous text-drawing operation.
+    /// </returns>
+    private async Task DrawPowerupDetected()
+    {
+        if (_worldCopy.Snakes.TryGetValue(_worldCopy.PlayerId, out var s))
+        {
+            if (s.score > _snakeLastScore)
+            {
+                //Adds powerup eaten indicator
+                var head = s.body.Last();
+                await _context.SetFontAsync("20px Arial");
+                await _context.SetFillStyleAsync("white");
+                await _context.FillTextAsync("+1", head.X - 20, head.Y + 20);
+                _updatedScoreSnakeFlash = DateTime.UtcNow;
+                _foodFlash = true;
+            }
+
+            _snakeLastScore = s.score;
+        }
+
+        if (_currentGameId != -1)
+        {
+            foreach (var snake in _worldCopy.Snakes.Values)
+            {
+                if (snake.score > snake.MaxScore)
+                {
+                    snake.MaxScore = snake.score;
+                    _db.UpdatePlayerScoreAsync(snake.Id, _currentGameId, snake.MaxScore);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Draws all snakes on the canvas, including their bodies and head labels.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task DrawSnakes()
+    {
+        // Loop through all snakes currently in the world copy
+        foreach (Snakes snake in _worldCopy.Snakes.Values)
+        {
+            // Only draw snakes that are alive and have at least 2 body points
+            if (snake.alive && snake.body.Count > 1)
+            {
+                string color = SnakeColorGenerator(snake.Id);
+                await _context.BeginPathAsync();
+                if (_foodFlash && snake.Id==_worldCopy.PlayerId)
+                {
+                    var elapsed = (DateTime.UtcNow - _updatedScoreSnakeFlash).TotalMilliseconds;
+
+                   if (elapsed <250)
+                   {
+                       color = "lime";
+                   }
+                   else
+                   { 
+                       _foodFlash = false;
+                   }
+                }
+                
+                // Begin drawing the snake body path
+                await _context.SetFillStyleAsync(color);
+                await _context.SetStrokeStyleAsync(color);
+                await _context.SetLineWidthAsync(10); //Width 10
+
+                // Move to the first body point (tail)
+                var tail = snake.body.First();
+                await _context.MoveToAsync(tail.X, tail.Y);
+                
+                // Draw lines through each body segment toward the head
+                for (int i = 1; i < snake.body.Count ; i++)
+                {
+                    var curr = snake.body[i];
+                    await _context.LineToAsync(curr.X, curr.Y); 
+                }
+
+                // Get the snake's head position for rendering text
+                var head = snake.body.Last();
+                if (_foodFlash && snake.Id==_worldCopy.PlayerId)
+                {
+                    await _context.SetFontAsync("20px Arial");
+                    await _context.SetFillStyleAsync(color);
+                    await _context.FillTextAsync("+1", head.X - 20, head.Y + 20);
+                }
+
+                // Draw player name and score near the head
+                await _context.SetFontAsync("20px Arial");
+                await _context.SetFillStyleAsync(color);
+                await _context.FillTextAsync(snake.name, head.X + 40, head.Y - 40);
+                await _context.FillTextAsync(snake.score.ToString(), head.X + 20, head.Y - 20);
+                
+                // Render the body path to the canvas
+                await _context.StrokeAsync();
+
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns a color string for a snake based on its player ID.
+    /// </summary>
+    /// <param name="playerID">The unique player ID.</param>
+    /// <returns>A color string from the predefined list.</returns>
+    private String SnakeColorGenerator(int playerID)
+    {
+        string[] colorList = new string[] { "red", "orange", "yellow", "green", "blue", "purple", "black", "white" };
+        int colNum = playerID % colorList.Length;
+        return colorList[colNum];
+    }
+
+    /// <summary>
+    /// Draws the game background image centered on the canvas.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task DrawBackground()
+    {
+        await _context.DrawImageAsync( _backgroundImage, -_world.Width / 2, -_world.Height / 2, _world.Width, _world.Height );
+    }
+    
+    /// <summary>
+    /// Draws all axis aligned walls from the world data onto the canvas using the given wall sprite.
+    /// </summary>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    private async Task DrawWalls()
+    {
+        
+        foreach (var wall in _worldCopy.Walls.Values)
+        {
+            double x1 = wall.p1.X;
+            double y1 = wall.p1.Y;
+            double x2 = wall.p2.X;
+            double y2 = wall.p2.Y;
+
+            if (y1 == y2) // Horizontal wall
+            {
+                double start = Math.Min(x1, x2);
+                double end = Math.Max(x1, x2);
+                
+                for(double x = start; x<=end; x+=50)
+                {
+                    await _context.DrawImageAsync( _wallSprite, x-25, y1-25, 50, 50 ); //Walls 50x50
+
+                }
+            }
+            else // Vertical wall
+            {
+                double start = Math.Min(y1, y2);
+                double end = Math.Max(y1, y2);
+                for(double y = start; y<=end; y+=50)
+                {
+                    await _context.DrawImageAsync( _wallSprite, x1-25, y-25, 50, 50 ); //Walls 50x50
+
+                }  
+            }
+        } 
+    }
+    
+    /// <summary>
+    /// Handles a key press input from the user and sends corresponding movement commands to the server.
+    /// </summary>
+    /// <param name="key">The key that was pressed.</param>
+    [JSInvokable]
+    public void HandleKeyPress( string key )
+    {
+        if (_isConnected == false || string.IsNullOrEmpty(key))
+        {
+            return;
+        }
+        if (key == "ArrowUp" || key == "w")
+        {
+            _controller.SendKeystrokeFromView("up"); //Send to server        
+        }
+        else if (key == "ArrowDown" || key == "s") 
+        {
+            _controller.SendKeystrokeFromView("down"); //Send to server        
+        }
+        else if (key == "ArrowLeft" || key == "a") 
+        {
+            _controller.SendKeystrokeFromView("left"); //Send to server        
+        }
+        else if (key == "ArrowRight" || key == "d") 
+        {
+            _controller.SendKeystrokeFromView("right"); //Send to server        
+        }
+    }
+
+}
+
